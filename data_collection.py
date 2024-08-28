@@ -158,6 +158,8 @@ class DataCollector:
         filename = f"./snapshots/{timestamp}-day{self.day}_all_stocks.csv"
         headers = ['Tick', 'StockID'] + [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + ["TotalTradeVolume", "TotalTradeValue"] + ['share_holding', 'orders', 'error_orders', 'order_value','trade_value','target_volume','remain_volume', 'frozen_volume']
         
+        logger.debug(f"Init: header:{headers}")
+        
         self.file = open(filename, 'w', newline='')
         self.writer = csv.writer(self.file)
         self.writer.writerow(headers)
@@ -200,8 +202,8 @@ class DataCollector:
 
                     row = [t, instrument]
                     row.extend(lob["askprice"])
-                    row.extend(lob["bidprice"])
                     row.extend(lob["askvolume"])
+                    row.extend(lob["bidprice"])
                     row.extend(lob["bidvolume"])
                     row.append(lob["trade_volume"])
                     row.append(lob["trade_value"])
@@ -230,8 +232,6 @@ class DataCollector:
         SimTimeLen = 3000
         endWaitTime = 600
         
-        
-
         while self.ConvertToSimTime_us(self.day) >= SimTimeLen:
             self.day += 1
 
