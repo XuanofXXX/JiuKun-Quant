@@ -18,10 +18,10 @@ from collections import deque
 from scipy.stats import linregress
 from sklearn.ensemble import RandomForestRegressor
 from sklearn.preprocessing import StandardScaler
-
-# from train_LSTM_more_factors import preprocess_dataframe
-
 from functools import wraps
+
+from utils.logger_config import setup_logger
+from utils.convert import ConvertToSimTime_us
 
 def async_timer(func):
     @wraps(func)
@@ -33,35 +33,10 @@ def async_timer(func):
         return result
     return wrapper
 
-if os.path.exists('./quant_info_log.log'):
-    os.remove('./quant_info_log.log')
-if os.path.exists('./quant_log.log'):
-    os.remove('./quant_log.log')
-# 设置日志
-logger = logging.getLogger(__name__)
-logger.setLevel(logging.DEBUG)
-
-file_handler = logging.FileHandler('quant_log.log', mode='w')
-file_handler.setLevel(logging.DEBUG)
-file_info_handler = logging.FileHandler('quant_info_log.log', mode='w')
-file_info_handler.setLevel(logging.INFO)
-console_handler = logging.StreamHandler()
-console_handler.setLevel(logging.INFO)
-
-formatter = logging.Formatter('%(asctime)s [%(levelname)s] %(message)s')
-file_handler.setFormatter(formatter)
-console_handler.setFormatter(formatter)
-file_info_handler.setFormatter(formatter)
-
-logger.addHandler(file_handler)
-logger.addHandler(file_info_handler)
-logger.addHandler(console_handler)
+logger = setup_logger('quant_log')
 
 def instrument2id(instrument: str):
     return int(instrument[-3:])
-
-def ConvertToSimTime_us(start_time, time_ratio, day, running_time):
-    return (time.time() - start_time - (day - 1) * running_time) * time_ratio
 
 class AsyncInterfaceClass:
     def __init__(self, domain_name):
@@ -128,7 +103,7 @@ class AsyncInterfaceClass:
             "price": price,
             "volume": volume,
         }
-        logger.debug(data)
+        logger.debug(f'ordering {data}')
         return await self.send_request("/TradeAPI/Order", data)
 
     async def sendCancel(self, token_ub, instrument, localtime, index):
@@ -136,9 +111,10 @@ class AsyncInterfaceClass:
             "token_ub": token_ub,
             "user_info": "",
             "instrument": instrument,
-            "localtime": localtime,
+            "localtime": int(localtime),
             "index": index
         }
+        logger.debug(f"canceling :{data}")
         return await self.send_request("/TradeAPI/Cancel", data)
 
 class LSTMModel(nn.Module):
@@ -254,10 +230,12 @@ class OrderStrategy:
         # 根据预测调整价格
         price_adjustment = self.alpha * spread * prediction
         
+        logger.debug(f"mid price: {mid_price}, price_adjustment: {price_adjustment}")
+        
         if side == "buy":
-            price = base_price - price_adjustment
-        else:  # sell
             price = base_price + price_adjustment
+        else:  # sell
+            price = base_price - price_adjustment
         
         # 确保价格在合理范围内
         return max(mid_price - spread, min(mid_price + spread, price))
@@ -270,83 +248,6 @@ class OrderStrategy:
         price = self.calculate_order_price(mid_price, spread, side, prediction)
         
         return side, round(size, 2), price
-
-class CancelOrderStrategy:
-    def __init__(self, max_order_age: int = 5, price_threshold: float = 0.005, volume_threshold: float = 0.5):
-        self.max_order_age = max_order_age  # 最大订单年龄（秒）
-        self.price_threshold = price_threshold  # 价格偏离阈值
-        self.volume_threshold = volume_threshold  # 成交量阈值
-
-    async def check_and_cancel_orders(self, api, token_ub, active_orders: List[Dict], current_lob: Dict, current_time: int):
-        cancel_tasks = []
-
-        for order in active_orders:
-            if self.should_cancel_order(order, current_lob, current_time):
-                cancel_tasks.append(self.cancel_order(api, token_ub, order, current_time))
-
-        if cancel_tasks:
-            await asyncio.gather(*cancel_tasks)
-
-    def should_cancel_order(self, order: Dict, current_lob: Dict, current_time: int) -> bool:
-        # 检查订单年龄
-        if current_time - order['localtime'] > self.max_order_age:
-            logger.info(f"Order {order['index']} exceeded max age, cancelling.")
-            return True
-
-        # 检查价格偏离
-        if order['direction'] == 'buy':
-            current_price = current_lob['askprice'][0]
-        else:
-            current_price = current_lob['bidprice'][0]
-
-        price_deviation = abs(order['price'] - current_price) / current_price
-        if price_deviation > self.price_threshold:
-            logger.info(f"Order {order['index']} price deviation {price_deviation:.2%} exceeded threshold, cancelling.")
-            return True
-
-        # 检查成交量
-        if order['volume'] > current_lob['askvolume'][0] * self.volume_threshold:
-            logger.info(f"Order {order['index']} volume {order['volume']} exceeded {self.volume_threshold:.0%} of market volume, cancelling.")
-            return True
-
-        return False
-
-    async def cancel_order(self, api, token_ub: str, order: Dict, current_time: int):
-        try:
-            response = await api.sendCancel(token_ub, order['instrument'], current_time, order['index'])
-            if response['status'] == 'Success':
-                logger.info(f"Successfully cancelled order {order['index']} for {order['instrument']}")
-            else:
-                logger.error(f"Failed to cancel order {order['index']}: {response}")
-        except Exception as e:
-            logger.error(f"Error cancelling order {order['index']}: {str(e)}")
-
-    async def update_and_cancel(self, api, token_ub: str, current_time: int):
-        try:
-            # 获取活跃订单
-            active_orders_response = await api.sendGetActiveOrder(token_ub)
-            if active_orders_response['status'] != 'Success':
-                logger.error(f"Failed to get active orders: {active_orders_response}")
-                return
-
-            active_orders = active_orders_response['rows']
-
-            # 获取最新的限价订单簿
-            lob_response = await api.sendGetAllLimitOrderBooks(token_ub)
-            if lob_response['status'] != 'Success':
-                logger.error(f"Failed to get limit order books: {lob_response}")
-                return
-
-            lobs = lob_response['lobs']
-
-            # 检查并取消订单
-            for order in active_orders:
-                instrument_id = int(order['instrument'][-3:])
-                current_lob = lobs[instrument_id]
-                await self.check_and_cancel_orders(api, token_ub, [order], current_lob, current_time)
-
-        except Exception as e:
-            logger.error(f"Error in update_and_cancel: {str(e)}")
 
 class LSTMTradingStrategy(BaseStrategy):
     def __init__(self, model_path="./trained_lstm_stock_model_120.pth", lookback_period=20, sequence_length=10):
@@ -362,7 +263,6 @@ class LSTMTradingStrategy(BaseStrategy):
         self.instruments = []
         self.target_positions = []
         self.order_strategy = OrderStrategy()
-        self.cancel_strategy = CancelOrderStrategy()
         # self.hft_order_strategy = AdvancedHFTStrategy(20)
 
     def load_model(self, model_path):
@@ -622,7 +522,7 @@ class LSTMTradingStrategy(BaseStrategy):
             prediction_df = pd.DataFrame({
                 'instrument': self.instruments,
                 'instrument_id': [int(instr[-3:]) for instr in self.instruments],
-                'prediction': predictions / 100000
+                'prediction': predictions / 10000
             })
             
             # Add target position information
@@ -630,13 +530,14 @@ class LSTMTradingStrategy(BaseStrategy):
             prediction_df = prediction_df.merge(user_info_df[['remain_volume', 'target_volume', 'frozen_volume']], 
                                                 left_on='instrument_id', right_index=True)
             
-            prediction_df['tradable_volume'] = prediction_df['remain_volume'] - prediction_df['target_volume']
+            prediction_df['tradable_volume'] = prediction_df['remain_volume'] - prediction_df['frozen_volume']
             prediction_df_mean = prediction_df['prediction'].mean()
             prediction_df_std = prediction_df['prediction'].std()
             
+            #TODO 这里prediction的阈值可以改
             prediction_df['valid_trade'] = (
-                ((prediction_df['prediction'] > prediction_df_mean + prediction_df_std / 3) & (prediction_df['target_volume'] > 0) & (prediction_df['tradable_volume'] != 0)) | \
-                ((prediction_df['prediction'] < prediction_df_mean - prediction_df_std / 3) & (prediction_df['target_volume'] < 0) & (prediction_df['tradable_volume'] != 0))
+                ((prediction_df['prediction'] > 0.01) & (prediction_df['target_volume'] > 0) & (prediction_df['tradable_volume'] != 0)) | \
+                ((prediction_df['prediction'] < -0.01) & (prediction_df['target_volume'] < 0) & (prediction_df['tradable_volume'] != 0))
             )
             
             logger.debug(f"Predict:{prediction_df['prediction'].describe()}")
@@ -692,18 +593,25 @@ class LSTMTradingStrategy(BaseStrategy):
                         order_tasks.append(api.sendOrder(token_ub, instrument, t, side, price, size))
 
             results = await asyncio.gather(*order_tasks, return_exceptions=True)
+            cancel_list = []
 
-            for result in results:
+            for idx, result in enumerate(results):
                 if isinstance(result, Exception):
                     logger.error(f"Order failed: {str(result)}")
                 elif result["status"] != "Success":
                     logger.error(f"Order failed: {result}")
+                elif result["status"] == "Volume Exceeds Target":
+                    order = order_tasks[idx]
+                    logger.error(f"{result['status']} Order task: {order}")
+                elif result["status"] == "Too Many Active Order":
+                    order = order_tasks[idx]
+                    logger.error(f"{result['status']} Order task: {order}")
                 else:
                     logger.info(f"Order placed successfully: {result}")
 
         except Exception as e:
             logger.error(f"Error executing trades: {str(e)}", exc_info=True)
-            
+
     async def execute_eod_strategy(self, api, token_ub, user_info, t):
         try:
             logger.info("Executing EOD strategy")
@@ -744,8 +652,37 @@ class LSTMTradingStrategy(BaseStrategy):
         except Exception as e:
             logger.error(f"Error executing EOD strategy: {str(e)}")
 
+    async def cancel_all_order(self, api, token_ub):
+        active_orders = await api.sendGetActiveOrder(token_ub)
+        index_list = []
+        if active_orders["status"] == "Success":
+            for idx, instrument_info in enumerate(active_orders["instruments"]):
+                if instrument_info['active_orders']:
+                    for order in instrument_info['active_orders']:
+                        index_list.append((instrument_info['instrument_name'] ,order['order_index']))
+        else:
+            logger.error(f"Failed to get active orders: {active_orders}")
+        return index_list
+
+    async def cancel_oldest_order(self, api, token_ub, instrument, t):
+        active_orders = await api.sendGetActiveOrder(token_ub)
+        if active_orders["status"] == "Success":
+            instrument_orders = active_orders["instruments"][instrument2id(instrument)]['active_orders']
+            if instrument_orders:
+                oldest_order = min(instrument_orders, key=lambda x: x["localtime"])
+                cancel_response = await api.sendCancel(token_ub, instrument, t, oldest_order["order_index"])
+                if cancel_response["status"] == "Success":
+                    logger.info(f"Cancelled oldest order for {instrument}: {oldest_order['order_index']}")
+                else:
+                    logger.error(f"Failed to cancel order for {instrument}: {cancel_response}")
+            else:
+                logger.warning(f"No active orders found for {instrument}")
+        else:
+            logger.error(f"Failed to get active orders: {active_orders}")
+
     async def work(self, api, token_ub, t):
         try:
+            
             # user_info = await api.sendGetUserInfo(token_ub)
             logger.info(f"Work time: {round(t)}")
             await self.update_market_data(api, token_ub)
@@ -754,7 +691,16 @@ class LSTMTradingStrategy(BaseStrategy):
             else:
                 # await self.update_market_data(api, token_ub)
                 await self.execute_trades(api, token_ub, self._cache_user_info, t)
-            # await self.cancel_strategy.update_and_cancel(api, token_ub, t)
+            if int(t) % 5 == 0:
+                logger.debug("Begin cancel")
+                index_list = await self.cancel_all_order(api, token_ub)
+                cancel_response = await asyncio.gather(*[api.sendCancel(token_ub, index[0], t, index[1]) for index in index_list])
+                for idx, resp in enumerate(cancel_response):
+                    order_info = index_list[idx]
+                    if resp["status"] == "Success":
+                        logger.info(f"Cancelled order for {order_info[0]}: {order_info[1]}")
+                    else:
+                        logger.error(f"Failed to cancel order for {order_info[0]}: {resp}\n {order_info}, {t}")
 
         except Exception as e:
             logger.error(f"Error in work method: {str(e)}")
@@ -794,6 +740,7 @@ class AsyncBotsDemoClass:
             self.GetInstruments(),
             self.api.sendGetGameInfo(self.token_ub)
             ])
+        
         response = response[-1]
         if response["status"] == "Success":
             self.start_time = response["next_game_start_time"]

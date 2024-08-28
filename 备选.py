@@ -118,3 +118,81 @@ class AdvancedHFTStrategy:
         price = self.calculate_order_price(lob, side, prediction, t)
         
         return side, size, price
+
+
+class CancelOrderStrategy:
+    def __init__(self, max_order_age: int = 5, price_threshold: float = 0.005, volume_threshold: float = 0.5):
+        self.max_order_age = max_order_age  # 最大订单年龄（秒）
+        self.price_threshold = price_threshold  # 价格偏离阈值
+        self.volume_threshold = volume_threshold  # 成交量阈值
+
+    async def check_and_cancel_orders(self, api, token_ub, active_orders: List[Dict], current_lob: Dict, current_time: int):
+        cancel_tasks = []
+
+        for order in active_orders:
+            if self.should_cancel_order(order, current_lob, current_time):
+                cancel_tasks.append(self.cancel_order(api, token_ub, order, current_time))
+
+        if cancel_tasks:
+            await asyncio.gather(*cancel_tasks)
+
+    def should_cancel_order(self, order: Dict, current_lob: Dict, current_time: int) -> bool:
+        # 检查订单年龄
+        if current_time - order['localtime'] > self.max_order_age:
+            logger.info(f"Order {order['index']} exceeded max age, cancelling.")
+            return True
+
+        # 检查价格偏离
+        if order['direction'] == 'buy':
+            current_price = current_lob['askprice'][0]
+        else:
+            current_price = current_lob['bidprice'][0]
+
+        price_deviation = abs(order['price'] - current_price) / current_price
+        if price_deviation > self.price_threshold:
+            logger.info(f"Order {order['index']} price deviation {price_deviation:.2%} exceeded threshold, cancelling.")
+            return True
+
+        # 检查成交量
+        if order['volume'] > current_lob['askvolume'][0] * self.volume_threshold:
+            logger.info(f"Order {order['index']} volume {order['volume']} exceeded {self.volume_threshold:.0%} of market volume, cancelling.")
+            return True
+
+        return False
+
+    async def cancel_order(self, api, token_ub: str, order: Dict, current_time: int):
+        try:
+            response = await api.sendCancel(token_ub, order['instrument'], current_time, order['index'])
+            if response['status'] == 'Success':
+                logger.info(f"Successfully cancelled order {order['index']} for {order['instrument']}")
+            else:
+                logger.error(f"Failed to cancel order {order['index']}: {response}")
+        except Exception as e:
+            logger.error(f"Error cancelling order {order['index']}: {str(e)}")
+
+    async def update_and_cancel(self, api, token_ub: str, current_time: int):
+        try:
+            # 获取活跃订单
+            active_orders_response = await api.sendGetActiveOrder(token_ub)
+            if active_orders_response['status'] != 'Success':
+                logger.error(f"Failed to get active orders: {active_orders_response}")
+                return
+
+            active_orders = active_orders_response['rows']
+
+            # 获取最新的限价订单簿
+            lob_response = await api.sendGetAllLimitOrderBooks(token_ub)
+            if lob_response['status'] != 'Success':
+                logger.error(f"Failed to get limit order books: {lob_response}")
+                return
+
+            lobs = lob_response['lobs']
+
+            # 检查并取消订单
+            for order in active_orders:
+                instrument_id = int(order['instrument'][-3:])
+                current_lob = lobs[instrument_id]
+                await self.check_and_cancel_orders(api, token_ub, [order], current_lob, current_time)
+
+        except Exception as e:
+            logger.error(f"Error in update_and_cancel: {str(e)}")

@@ -3,15 +3,11 @@ import logging.handlers
 import aiohttp
 import csv
 import time
+import pandas as pd
 from datetime import datetime
-import logging
+from utils.logger_config import setup_logger
 
-logging.basicConfig(level=logging.DEBUG, format='%(asctime)s [%(levelname)s] %(message)s')
-logger = logging.getLogger(__name__)
-
-File_handler = logging.FileHandler('./data_collection.log', 'w')
-File_handler.setLevel(logging.INFO)
-logger.addHandler(File_handler)
+logger = setup_logger('data_collector')
 
 def convert_api_to_df_format(api_response):
         # 创建一个字典来存储转换后的数据
@@ -160,7 +156,7 @@ class DataCollector:
     def initialize_file(self):
         timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
         filename = f"./snapshots/{timestamp}-day{self.day}_all_stocks.csv"
-        headers = ['Tick', 'StockID'] + [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + ["TotalTradeVolume", "TotalTradeValue", "RemainPositions", "TargetPositions"]
+        headers = ['Tick', 'StockID'] + [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + ["TotalTradeVolume", "TotalTradeValue"] + ['share_holding', 'orders', 'error_orders', 'order_value','trade_value','target_volume','remain_volume', 'frozen_volume']
         
         self.file = open(filename, 'w', newline='')
         self.writer = csv.writer(self.file)
@@ -195,11 +191,11 @@ class DataCollector:
                 wait_for_first_success(tasks_lob),
                 wait_for_first_success(tasks_user_info)
             )
+            
 
             if lob_result["status"] == "Success" and user_info_result["status"] == "Success":
                 for i, lob in enumerate(lob_result["lobs"]):
-                    remain_position = user_info_result['rows'][i]['remain_volume']
-                    target_position = user_info_result['rows'][i]['target_volume']
+                    instr_info = user_info_result['rows'][i]
                     instrument = self.instruments[i]
 
                     row = [t, instrument]
@@ -209,8 +205,14 @@ class DataCollector:
                     row.extend(lob["bidvolume"])
                     row.append(lob["trade_volume"])
                     row.append(lob["trade_value"])
-                    row.append(remain_position)
-                    row.append(target_position)
+                    row.append(instr_info['share_holding'])
+                    row.append(instr_info['orders'])
+                    row.append(instr_info['error_orders'])
+                    row.append(instr_info['order_value'])
+                    row.append(instr_info['trade_value'])
+                    row.append(instr_info['target_volume'])
+                    row.append(instr_info['remain_volume'])
+                    row.append(instr_info['frozen_volume'])
                     
                     self.data_buffer.append(row)
 
@@ -227,6 +229,8 @@ class DataCollector:
     async def run(self):
         SimTimeLen = 3000
         endWaitTime = 600
+        
+        
 
         while self.ConvertToSimTime_us(self.day) >= SimTimeLen:
             self.day += 1
