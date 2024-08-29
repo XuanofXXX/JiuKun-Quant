@@ -22,7 +22,12 @@ from sklearn.preprocessing import StandardScaler
 
 
 from utils.logger_config import setup_logger
-from utils.convert import ConvertToSimTime_us
+from utils.convert import (
+    ConvertToSimTime_us,
+    convert_userinfo_response_to_df_format,
+    convert_LOB_response_to_df_format
+)
+
 
 def async_timer(func):
     @wraps(func)
@@ -79,7 +84,7 @@ class AsyncInterfaceClass:
             await self.session.close()
             self.session = None
 
-    @async_retry()
+    @async_retry(20)
     async def send_request(self, endpoint, data):
         if not self.session:
             await self.create_session()
@@ -161,66 +166,6 @@ class LSTMModel(nn.Module):
         out = self.fc(out[:, -1, :])
         return out
 
-class BaseStrategy:
-    def __init__(self):
-        self._cache_lobs = None
-        self._cache_user_info = None
-    
-    @staticmethod
-    def convert_api_to_df_format(api_response):
-        # 创建一个字典来存储转换后的数据
-        base_data = {
-            'Tick': [], 'StockID': [],
-            'AskPrice1': [], 'AskPrice2': [], 'AskPrice3': [], 'AskPrice4': [], 'AskPrice5': [],
-            'AskPrice6': [], 'AskPrice7': [], 'AskPrice8': [], 'AskPrice9': [], 'AskPrice10': [],
-            
-            'AskVolume1': [], 'AskVolume2': [], 'AskVolume3': [], 'AskVolume4': [], 'AskVolume5': [],
-            'AskVolume6': [], 'AskVolume7': [], 'AskVolume8': [], 'AskVolume9': [], 'AskVolume10': [],
-            
-            'BidPrice1': [], 'BidPrice2': [], 'BidPrice3': [], 'BidPrice4': [], 'BidPrice5': [],
-            'BidPrice6': [], 'BidPrice7': [], 'BidPrice8': [], 'BidPrice9': [], 'BidPrice10': [],
-            
-            'BidVolume1': [], 'BidVolume2': [], 'BidVolume3': [], 'BidVolume4': [], 'BidVolume5': [],
-            'BidVolume6': [], 'BidVolume7': [], 'BidVolume8': [], 'BidVolume9': [], 'BidVolume10': [],
-            
-            'TotalTradeVolume': [], 'TotalTradeValue': [],
-            'limit_up_price': [],
-            'limit_down_price': [],'last_price': [],
-            'twap': []
-        }
-
-        for idx, item in enumerate(api_response):
-            # 填充Ask价格和数量
-            for i in range(10):
-                base_data[f'AskPrice{i+1}'].append(item['askprice'][i])
-                base_data[f'AskVolume{i+1}'].append(item['askvolume'][i])
-
-            # 填充Bid价格和数量
-            for i in range(10):
-                base_data[f'BidPrice{i+1}'].append(item['bidprice'][i])
-                base_data[f'BidVolume{i+1}'].append(item['bidvolume'][i])
-
-            # 填充总成交量和总成交额
-            base_data['TotalTradeVolume'].append(item['trade_volume'])
-            base_data['TotalTradeValue'].append(item['trade_value'])
-            base_data['Tick'].append(item['localtime'])
-            base_data['StockID'].append(f'UBIQ{idx:03}')
-            
-            base_data['limit_up_price'].append(item['limit_up_price'])
-            base_data['limit_down_price'].append(item['limit_down_price'])
-            base_data['twap'].append(item['twap'])
-            base_data['last_price'].append(item['last_price'])
-
-        # 创建DataFrame
-        df = pd.DataFrame(base_data)
-        return df
-
-    def _union_lobs(self, df: pd.DataFrame):
-        # if self._cache_lobs is None:
-        #     self._cache_lobs = df
-        # else:
-        self._cache_lobs = pd.concat([self._cache_lobs, df], axis=0, ignore_index=True)
-
 class OrderStrategy:
     def __init__(self, time_window=3000, start_size = 100, alpha=0.1, beta=0.2, gamma=0.3):
         self.time_window = time_window
@@ -272,6 +217,7 @@ class OrderStrategy:
 
         # 计算每批订单的大小
         batch_sizes = self.calculate_batch_sizes(total_trade_volume)
+        logger.debug(f"total_trade_volume: {total_trade_volume}")
 
         if side == "buy":
             price_levels = list(zip(current_lob['BidPrice1':'BidPrice10'], current_lob['BidVolume1':'BidVolume10']))
@@ -279,32 +225,42 @@ class OrderStrategy:
         else:
             price_levels = list(zip(current_lob['AskPrice1':'AskPrice10'], current_lob['AskVolume1':'AskVolume10']))
             price_levels.sort(key=lambda x: x[0])  # 从低到高排序卖价
-
+        
         for i, batch_size in enumerate(batch_sizes):
             if i >= len(price_levels):
                 break
 
-            price, volume = price_levels[i]
+            # price, volume = price_levels[i]
+            spread = current_lob['AskPrice1'] - current_lob['BidPrice1']
             
             # 第一批订单使用更保守的价格
+            # TODO 调一下分批的价格和量
             if i == 0:
+                price = current_lob['BidPrice1'] if side == "buy" else current_lob['AskPrice1']
                 adjusted_price = self.adjust_price_conservative(price, side, prev_lob)
+            elif i == 1:
+                price = current_lob['BidPrice2'] if side == "buy" else current_lob['AskPrice2']
+                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob)
             else:
-                adjusted_price = self.adjust_price_aggressive(price, side, prediction, prev_lob)
+                # todo 赌的可能有点大
+                price = current_lob['BidPrice5'] if side == "buy" else current_lob['AskPrice5']
+                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob)
+            
 
             # 确保价格是2位小数
             adjusted_price = round(adjusted_price, 2)
-
             orders.append((side, batch_size, adjusted_price))
 
+        
+        logger.debug(f"拆单之后的单子：{(side, batch_size, adjusted_price)}")
         return orders
 
     def calculate_batch_sizes(self, total_size):
         batch_sizes = []
         remaining = total_size
 
-        # 第一批：50%的总量，但不少于1000，并且是100的倍数
-        first_batch = max(int(total_size * 0.5) // 100 * 100, 1000)
+        # 第一批：40%的总量，但不少于100，并且是100的倍数
+        first_batch = max(int(total_size * 0.4) // 100 * 100, 100)
         batch_sizes.append(first_batch)
         remaining -= first_batch
 
@@ -320,27 +276,30 @@ class OrderStrategy:
 
         return batch_sizes
 
-    # def adjust_price_conservative(self, base_price, side, prev_lob):
-    #     # 更保守的价格调整，更接近当前市场价格
-    #     if side == "buy":
-    #         return round(min(base_price, prev_lob['As
+    # todo 更迅速地把货出完
     def adjust_price_conservative(self, base_price, side, prev_lob):
         # 更保守的价格调整，更接近当前市场价格
         if side == "buy":
-            return round(min(base_price, prev_lob['AskPrice1']), 2)
+            # return round(min(base_price, prev_lob['AskPrice1']), 2)
+            return round(max(base_price, prev_lob['AskPrice1']), 2)
         else:  # sell
-            return round(max(base_price, prev_lob['BidPrice1']), 2)
+            # return round(max(base_price, prev_lob['BidPrice1']), 2)
+            return round(min(base_price, prev_lob['BidPrice1']), 2)
 
-    def adjust_price_aggressive(self, base_price, side, prediction, prev_lob):
+    def adjust_price_aggressive(self, base_price, spread, side, prediction, prev_lob):
         # 更激进的价格调整，考虑预测因素
+        price_adjustment = 0.5 * spread
+        logger.debug(f"aggressive price_adjustment: {price_adjustment}")
         if side == "buy":
-            prev_ask = prev_lob['AskPrice1']
-            price_adjustment = self.alpha * prediction * (base_price - prev_ask)
-            return round(base_price + price_adjustment, 2)
-        else:  # sell
-            prev_bid = prev_lob['BidPrice1']
-            price_adjustment = self.alpha * prediction * (prev_bid - base_price)
+            # prev_ask = prev_lob['AskPrice2']
+            # price_adjustment = self.alpha * prediction * (base_price - prev_ask)
             return round(base_price - price_adjustment, 2)
+        else:  # sell
+            # prev_bid = prev_lob['BidPrice2']
+            # price_adjustment = self.alpha * prediction * (prev_bid - base_price)
+            # price_adjustment = 0.5 * spread
+            # logger.debug(f"aggressive price_adjustment: {price_adjustment}")
+            return round(base_price + price_adjustment, 2)
     
     def adjust_price(self, base_price, side, prediction, prev_lob):
         # 根据预测和之前的LOB调整价格
@@ -363,11 +322,12 @@ class OrderStrategy:
         # 时间因子：随着剩余时间减少，增加订单大小
         time_factor = max(0.01, 1 - (remaining_time / self.time_window))
         
-        # 目标仓位因子：距离目标仓位越远，订单大小越大
+        # 目标仓位因子：距离目标仓位越远，订单大小越小
         position_factor = abs(target_position) / (abs(target_position) + abs(tradable_size))
         
         # 预测因子：根据预测的强度调整订单大小
-        prediction_factor = 0.5 + self.gamma * abs(prediction)
+        # todo 这里的abs(prediction) * 100是为了将预测值映射到0.5-1.5之间
+        prediction_factor = 0.5 + self.gamma * abs(prediction) * 100
         
         # 计算最终订单大小
         size = base_size * time_factor * position_factor * prediction_factor
@@ -391,10 +351,17 @@ class OrderStrategy:
         
         return side, size , round(price,2)
 
-class LSTMTradingStrategy(BaseStrategy):
+class LSTMTradingStrategy:
     def __init__(self, model_path="./trained_lstm_stock_model_180.pth", lookback_period=20, sequence_length=10):
         super().__init__()
         self.model = self.load_model(model_path)
+        self._cache_lobs = None
+        self._cache_user_info = None
+        self._cache_past_trade_price = None
+        # Tick  StockID   Price Volume OrderIndex
+        # 0   2716  UBIQ001    6.49    100     153027
+        # ...
+        # 80  2741  UBIQ042  -92.75    100      95958
         self.scaler = StandardScaler()
         self.lookback_period = lookback_period
         self.sequence_length = sequence_length
@@ -404,13 +371,13 @@ class LSTMTradingStrategy(BaseStrategy):
         
         # 新增：用于时间冷却期和动态阈值调整
         self.initial_cooldown = 40
-        self.final_cooldown = 10  # 最终冷却期更短
+        self.final_cooldown = 5  # 最终冷却期更短
         # TODO 可以提高一点阈值，来降低初期的爆发交易量
         self.initial_threshold = 0.01
         self.final_threshold = 0.001  # 最终阈值更低
         self.max_order_size_ratio = 0.2  # 初始最大订单比例
         self.emergency_time = 2700  # 紧急模式触发时间（交易日的最后300秒）
-        self.critical_emergency_time = 2930
+        self.critical_emergency_time = 2950
         
         self.last_trade_time = {}
         self.trade_count = {}
@@ -632,15 +599,17 @@ class LSTMTradingStrategy(BaseStrategy):
             if lob_result is None or user_info_result is None:
                 raise Exception("Failed to get either LOB or Trades data")
             
-            new_data = self.convert_api_to_df_format(lob_result["lobs"])
+            new_data = convert_LOB_response_to_df_format(lob_result["lobs"])
+            new_data['vwap'] = new_data['TotalTradeValue'] / new_data['TotalTradeVolume']
             
-            self._cache_user_info = user_info_result['rows']
+            max_tick = new_data['Tick'].max()
             
             if self._cache_lobs is None:
                 self._cache_lobs = new_data
                 logger.info(f"Added {len(new_data)} new records at tick: {new_data['Tick'].max()}.")
                 return
             
+            self._cache_user_info = convert_userinfo_response_to_df_format(user_info_result['rows'], max_tick)
             # 使用更高效的方法更新数据
             max_existing_tick = self._cache_lobs['Tick'].max()
             new_data = new_data[new_data['Tick'] > max_existing_tick]
@@ -673,83 +642,114 @@ class LSTMTradingStrategy(BaseStrategy):
         progress = min(t / 3000, 1)  # 交易日进度，范围 0 到 1
         cooldown = int(self.initial_cooldown - (self.initial_cooldown - self.final_cooldown) * progress)
         threshold = self.initial_threshold - (self.initial_threshold - self.final_threshold) * progress
-        order_size_ratio = self.max_order_size_ratio + (1 - self.max_order_size_ratio) * progress
-        return cooldown, threshold, order_size_ratio
+        # order_size_ratio = self.max_order_size_ratio + (1 - self.max_order_size_ratio) * progress
+        return cooldown, threshold
 
-    @async_timer
-    async def execute_trades(self, api, token_ub, user_info, t):
-        try:
-            if isinstance(t, float):
-                t = int(t)
-            stock_df = self._cache_lobs
-            factors_df = self.calculate_factors(stock_df)
-            input_tensor = self.factorDF2Tensor(factors_df)
-            
-            with torch.no_grad():
-                predictions = self.model(input_tensor).numpy().flatten()
-
-            prediction_df = pd.DataFrame({
+    def pre_processing(self):
+        stock_df = self._cache_lobs
+        factors_df = self.calculate_factors(stock_df)
+        input_tensor = self.factorDF2Tensor(factors_df)
+        with torch.no_grad():
+            predictions = self.model(input_tensor).numpy().flatten()
+        
+        prediction_df = pd.DataFrame({
                 'instrument': self.instruments,
                 'instrument_id': [int(instr[-3:]) for instr in self.instruments],
                 'prediction': predictions / 10000
             })
             
-            # Add target position information
-            user_info_df = pd.DataFrame(user_info)
-            prediction_df = prediction_df.merge(user_info_df[['remain_volume', 'target_volume', 'frozen_volume']], 
-                                                left_on='instrument_id', right_index=True)
+        # Add target position information
+        user_info_df = self._cache_user_info
+        logger.debug(f'user info df: {user_info_df}')
+        prediction_df = prediction_df.merge(user_info_df[['remain_volume', 'target_volume', 'frozen_volume']], 
+                                            left_on='instrument_id', right_index=True)
+        
+        prediction_df['tradable_volume'] = prediction_df['remain_volume'] - prediction_df['frozen_volume']
+        logger.debug(f"Prediction_df columns: {prediction_df.columns}")
+        return stock_df, prediction_df
+
+    def choose_stocks(self, prediction_df: pd.DataFrame, t):
+        '''
+        The prediction_df.columns:
+            'instrument', 'instrument_id', 'prediction', 'remain_volume',
+            'target_volume', 'frozen_volume', 'tradable_volume'
+        '''
+        
+        cooldown, threshold = self.calculate_dynamic_params(t)
+
+        # TODO 对机会的定义更严格
+        # 1. 看过去的10|20|30|100个成交金额
+        # 2. 过去波动是否剧烈
+        # 3. 均线穿越的策略（VWAP和twap）
+        # 4. VWAP， twap
+        # 5. 综合的策略，比如5满足3即可
+        def can_trade(instrument, prediction, tradable_volume, target_volume):
+            last_trade = self.last_trade_time.get(instrument, 0)
+            if t - last_trade < cooldown:
+                return False
+            if t > self.critical_emergency_time:
+                return True
+            if abs(prediction) <= threshold:
+                return False
+            # return abs(tradable_volume) / abs(target_volume) > 0.1  # 如果剩余交易量占目标的10%以上
+            return False
+
+        # 紧急模式：如果接近收盘且还有大量未完成的目标仓位
+        is_emergency = t >= self.emergency_time
+        if is_emergency:
+            logger.warning(f"Entering emergency mode at tick {t}")
+            threshold *= 0.5  # 在紧急模式下降低阈值
+        
+        def calculate_combined_score(row, current_price, prediction, model_weight, twap_weight, vwap_weight):
+            twap_diff = (current_price - row['twap']) / row['twap']
+            vwap_diff = (current_price - row['vwap']) / row['vwap']
             
-            prediction_df['tradable_volume'] = prediction_df['remain_volume'] - prediction_df['frozen_volume']
-            
-            cooldown, threshold, order_size_ratio = self.calculate_dynamic_params(t)
+            if row['target_volume'] > 0:  # 买入
+                return model_weight * prediction - twap_weight * twap_diff - vwap_weight * vwap_diff
+            else:  # 卖出
+                return model_weight * prediction + twap_weight * twap_diff + vwap_weight * vwap_diff
+        
+        prediction_df['valid_trade'] = prediction_df.apply(
+            lambda row: (
+                (is_emergency or can_trade(row['instrument'], row['prediction'], row['tradable_volume'], row['target_volume'])) and
+                (
+                    (row['target_volume'] > 0 and row['tradable_volume'] > 0) or
+                    (row['target_volume'] < 0 and row['tradable_volume'] < 0)
+                )
+            ),
+            axis=1
+        )
+        
+        logger.debug(f"tradable stock: {prediction_df['valid_trade'].sum()}")
+        logger.debug(f"Predict:{prediction_df['prediction'].describe()}")
+        logger.debug(f"PredictionDF target_volume:{prediction_df['target_volume'].describe()}")
+        logger.debug(f"PredictionDF tradable_volume:{prediction_df['tradable_volume'].describe()}")
+        
+        valid_trades = prediction_df[prediction_df['valid_trade']]
+        logger.debug(f"valid_trades_df : {valid_trades.columns}")
+        
+        # TODO 选取前几个比较厉害的来算
+        buy_candidates = valid_trades[valid_trades['target_volume'] > 0].nlargest(self.nlargest, 'prediction')
+        sell_candidates = valid_trades[valid_trades['target_volume'] < 0].nsmallest(self.nlargest, 'prediction')
+        
+        logger.debug(f"Valid trades: {len(valid_trades)}")
+        logger.debug(f"Buy candidates: {len(buy_candidates)}")
+        logger.debug(f"Sell candidates: {len(sell_candidates)}")
+        
+        return buy_candidates, sell_candidates
+
+    @async_timer
+    async def execute_trades(self, api, token_ub, t):
+        try:
+            if isinstance(t, float):
+                t = int(t)
             remaining_time = max(0, 3000 - t)
-
-            def can_trade(instrument, prediction, tradable_volume, target_volume):
-                last_trade = self.last_trade_time.get(instrument, 0)
-                if t - last_trade < cooldown:
-                    return False
-                if t > self.critical_emergency_time:
-                    return abs(tradable_volume) > 0
-                if abs(prediction) <= threshold:
-                    return False
-                return abs(tradable_volume) / abs(target_volume) > 0.1  # 如果剩余交易量占目标的10%以上
-
-            # 紧急模式：如果接近收盘且还有大量未完成的目标仓位
-            is_emergency = t >= self.emergency_time
-            if is_emergency:
-                logger.warning(f"Entering emergency mode at tick {t}")
-                threshold *= 0.5  # 在紧急模式下降低阈值
-
-            prediction_df['valid_trade'] = prediction_df.apply(
-                lambda row: (
-                    (is_emergency or can_trade(row['instrument'], row['prediction'], row['tradable_volume'], row['target_volume'])) and
-                    (
-                        (row['target_volume'] > 0 and row['tradable_volume'] > 0) or
-                        (row['target_volume'] < 0 and row['tradable_volume'] < 0)
-                    )
-                ),
-                axis=1
-            )
-            
-            logger.debug(f"tradable stock: {prediction_df['valid_trade'].sum()}")
-            logger.debug(f"Predict:{prediction_df['prediction'].describe()}")
-            logger.debug(f"PredictionDF target_volume:{prediction_df['target_volume'].describe()}")
-            logger.debug(f"PredictionDF tradable_volume:{prediction_df['tradable_volume'].describe()}")
-            
-            valid_trades = prediction_df[prediction_df['valid_trade']]
-            logger.debug(f"valid_trades_df : {valid_trades.columns}")
-            
-            # TODO 选取前几个比较厉害的来算
-            buy_candidates = valid_trades[valid_trades['target_volume'] > 0].nlargest(self.nlargest, 'prediction')
-            sell_candidates = valid_trades[valid_trades['target_volume'] < 0].nsmallest(self.nlargest, 'prediction')
+            stock_df, prediction_df = self.pre_processing()
+            buy_candidates, sell_candidates = self.choose_stocks(prediction_df, t)
             
             order_tasks = []
             order_info_list = []
             chosen_stock_list = []
-
-            logger.debug(f"Valid trades: {len(valid_trades)}")
-            logger.debug(f"Buy candidates: {len(buy_candidates)}")
-            logger.debug(f"Sell candidates: {len(sell_candidates)}")
 
             for side, candidates in [("buy", buy_candidates), ("sell", sell_candidates)]:
                 for _, row in candidates.iterrows():
@@ -797,52 +797,47 @@ class LSTMTradingStrategy(BaseStrategy):
                         if size > 0:
                             logger.info(f"Placing split order for {instrument}: {split_side} {size} @ {price}")
                             order_tasks.append(api.sendOrder(token_ub, instrument, t, split_side, price, size))
-                            order_info_list.append((instrument, t, split_side, price, size))
-                    
-                    # target_position = prediction_df[prediction_df['instrument'] == instrument]["target_volume"].iloc[0]
-                    # remain_volume = prediction_df[prediction_df['instrument'] == instrument]["remain_volume"].iloc[0]
-                    # frozen_volume = prediction_df[prediction_df['instrument'] == instrument]["frozen_volume"].iloc[0]
-                    # tradable_volume = prediction_df[prediction_df['instrument'] == instrument]['tradable_volume'].iloc[0]
-                    
-                    # current_position = target_position - remain_volume - frozen_volume
-                    
-                    # logger.debug(f"single lob is {lob}")
-                    
-                    # # TODO 拆分订单量，上一个tick的LOB，流动性。不同档位的量对应不同档位的订单价格
-                    # side, size, price = self.order_strategy.get_order_params(
-                    #     lob, tradable_volume, t, side, row['prediction']
-                    # )
-                    
-                    # price = round(price, 2)
-                    # logger.info(f"Placing order for {instrument}: {side} {size} @ {price}")
-                    
-                    # if size > 0:
-                    #     logger.info(f"Placing order for {instrument}: {side} {size} @ {price}")
-                    #     order_tasks.append(api.sendOrder(token_ub, instrument, t, side, price, size))
-                    #     order_info_list.append((instrument, t, side, price, size))
+                            order_info_list.append((t, instrument, split_side, price, size))
 
-            results = await asyncio.gather(*order_tasks, return_exceptions=True)
-            cancel_list = []
-
-            for idx, result in enumerate(results):
-                if isinstance(result, Exception):
-                    logger.error(f"Order failed: {str(result)}")
-                elif result["status"] == "Success":
-                    logger.info(f"Order placed successfully: {result}")
-                elif result["status"] == "Volume Exceeds Target":
-                    order = order_tasks[idx]
-                    logger.error(f"{result['status']} Order task: {order}")
-                elif result["status"] == "Too Many Active Order":
-                    order = order_tasks[idx]
-                    logger.error(f"{result['status']} Order task: {order}")
-                else:
-                    logger.error(f"Order failed: {result}")
-                    
+            await self.send_all_order(order_tasks, order_info_list)
 
         except Exception as e:
             logger.error(f"Error executing trades: {str(e)}", exc_info=True)
+    
+    async def send_all_order(self, order_list_coroutine, order_info_list):
+        results = await asyncio.gather(*order_list_coroutine, return_exceptions=True)
 
-    async def send_all_order(self, api, token_ub):
+        for idx, result in enumerate(results):
+            if isinstance(result, Exception):
+                logger.error(f"Order failed: {str(result)}")
+            elif result["status"] == "Success":
+                order_detail = order_info_list[idx]
+                order_index = result['index']
+                logger.info(f"Order placed successfully: {result}")
+                if self._cache_past_trade_price is None:
+                    self._cache_past_trade_price = pd.DataFrame(
+                        columns=['Tick', 'StockID', 'Price', 'Volume', 'OrderIndex']
+                    )
+                
+                logger.debug(f'new_row_append:{list(order_detail) + [order_index]}')
+                # new_row_append:[766, 'UBIQ049', 'buy', 57.91, 100, 62695]
+                new_row = pd.DataFrame([list(order_detail) + [order_index]], columns=['Tick', 'StockID','Side', 'Price', 'Volume', 'OrderIndex'])
+                logger.debug(f'new_row:{new_row}')
+                # The truth value of a Series is ambiguous. Use a.empty, a.bool(), a.item(), a.any() or a.all().
+                new_row['Price'] = -new_row['Price'] if new_row['Side'].item() == 'sell' else new_row['Price']
+                new_row = new_row.drop('Side', axis=1)
+                self._cache_past_trade_price = pd.concat([self._cache_past_trade_price, new_row], ignore_index=True)
+                
+            elif result["status"] == "Volume Exceeds Target":
+                order_detail = order_info_list[idx]
+                logger.error(f"{result['status']} Order task: {order_detail}")
+            elif result["status"] == "Too Many Active Order":
+                order_detail = order_info_list[idx]
+                logger.error(f"{result['status']} Order task: {order_detail}")
+            else:
+                logger.error(f"Order failed: {result}")
+
+    async def cancel_all_order(self, api, token_ub, t):
         active_orders = await api.sendGetActiveOrder(token_ub)
         index_list = []
         if active_orders["status"] == "Success":
@@ -852,36 +847,23 @@ class LSTMTradingStrategy(BaseStrategy):
                         index_list.append((instrument_info['instrument_name'] ,order['order_index']))
         else:
             logger.error(f"Failed to get active orders: {active_orders}")
-        return index_list
-
-    async def cancel_all_order(self, api, token_ub):
-        active_orders = await api.sendGetActiveOrder(token_ub)
-        index_list = []
-        if active_orders["status"] == "Success":
-            for idx, instrument_info in enumerate(active_orders["instruments"]):
-                if instrument_info['active_orders']:
-                    for order in instrument_info['active_orders']:
-                        index_list.append((instrument_info['instrument_name'] ,order['order_index']))
-        else:
-            logger.error(f"Failed to get active orders: {active_orders}")
-        return index_list
+        cancel_response = await asyncio.gather(*[api.sendCancel(token_ub, index[0], t, index[1]) for index in index_list])
+        for idx, resp in enumerate(cancel_response):
+            order_info = index_list[idx]
+            if resp["status"] == "Success":
+                logger.info(f"Cancelled order for {order_info[0]}: {order_info[1]}")
+                self._cache_past_trade_price = self._cache_past_trade_price[self._cache_past_trade_price['index'] != order_info[1]]
+            else:
+                logger.error(f"Failed to cancel order for {order_info[0]}: {resp}\n {order_info}, {t}")
     
     async def work(self, api, token_ub, t):
         try:
             logger.info(f"Work time: {round(t)}")
             await self.update_market_data(api, token_ub)
-            if int(t) % 10 == 0:
-                self._cache_lobs
-                logger.debug("Begin cancel")
-                index_list = await self.cancel_all_order(api, token_ub)
-                cancel_response = await asyncio.gather(*[api.sendCancel(token_ub, index[0], t, index[1]) for index in index_list])
-                for idx, resp in enumerate(cancel_response):
-                    order_info = index_list[idx]
-                    if resp["status"] == "Success":
-                        logger.info(f"Cancelled order for {order_info[0]}: {order_info[1]}")
-                    else:
-                        logger.error(f"Failed to cancel order for {order_info[0]}: {resp}\n {order_info}, {t}")
-            await self.execute_trades(api, token_ub, self._cache_user_info, t)
+            if int(t) % 5 == 0:
+                await self.cancel_all_order(api, token_ub, t)
+            await self.execute_trades(api, token_ub, t)
+            logger.debug(f"current past_trade_price_df:{self._cache_past_trade_price}")
 
         except Exception as e:
             logger.error(f"Error in work method: {str(e)}")
@@ -944,7 +926,6 @@ class AsyncBotsDemoClass:
         t = ConvertToSimTime_us(self.start_time, self.time_ratio, self.day, self.running_time)
         await self.strategy.work(self.api, self.token_ub, t)
 
-
 async def main(username, password):
     bot = AsyncBotsDemoClass(username, password, 30020)
     await bot.init()
@@ -953,9 +934,9 @@ async def main(username, password):
 
     while ConvertToSimTime_us(bot.start_time, bot.time_ratio, bot.day, bot.running_time) >= SimTimeLen:
         bot.day += 1
-    logger.info(f"current day: {bot.day}")
     
     while bot.day <= bot.running_days:
+        logger.info(f"current day: {bot.day}")
         while ConvertToSimTime_us(bot.start_time, bot.time_ratio, bot.day, bot.running_time) <= -1:
             await asyncio.sleep(0.1)
         

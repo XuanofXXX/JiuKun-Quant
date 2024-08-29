@@ -7,6 +7,7 @@ import pandas as pd
 from datetime import datetime
 from utils.logger_config import setup_logger
 from functools import wraps
+import random
 
 logger = setup_logger('data_collector')
 
@@ -98,7 +99,7 @@ class AsyncInterfaceClass:
             await self.session.close()
             self.session = None
 
-    @async_retry(10)
+    @async_retry(20)
     async def send_request(self, endpoint, data):
         if not self.session:
             await self.create_session()
@@ -182,7 +183,7 @@ class DataCollector:
         return (time.time() - self.start_time - (day - 1) * self.running_time) * self.time_ratio
 
     def initialize_file(self):
-        timestamp = datetime.now().strftime("%Y%m%d-%H%M%S")
+        timestamp = datetime.fromtimestamp(self.start_time).strftime("%m%d%H")
         filename = f"./snapshots/{timestamp}-day{self.day}_all_stocks.csv"
         headers = ['Tick', 'StockID'] + [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + ["TotalTradeVolume", "TotalTradeValue"] + ['share_holding', 'orders', 'error_orders', 'order_value','trade_value','target_volume','remain_volume', 'frozen_volume']
         
@@ -249,8 +250,10 @@ class DataCollector:
                 if len(self.data_buffer) >= 1000:  # 每1000行写入一次文件
                     self.writer.writerows(self.data_buffer)
                     self.data_buffer.clear()
+                    logger.info(f"Data save at day:{self.day} time: {t}")
 
-                logger.info(f"Data collected at sim time: {t}")
+                logger.info(f"Data collected at day:{self.day} time: {t}")
+                logger.debug(f"Data collected {row}")
             else:
                 logger.error(f"Failed to get data: LOB status: {lob_result['status']}, UserInfo status: {user_info_result['status']}")
         except Exception as e:
