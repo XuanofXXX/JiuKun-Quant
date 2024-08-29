@@ -231,48 +231,11 @@ class OrderStrategy:
         self.min_order_size = 100  # 最小订单大小
         self.max_price_levels = 3 # 最多使用的价格档位数
 
-    # def split_orders(self, current_lob, prev_lob, tradable_size, remaining_time, target_position, t, side, prediction):
-    #     orders = []
-    #     remaining_size = abs(tradable_size)
-    #     adjusted_size = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction)
-        
-    #     if side == "buy":
-    #         price_levels = list(zip(current_lob['BidPrice1':'BidPrice10'], current_lob['BidVolume1':'BidVolume10']))
-    #         price_levels.sort(key=lambda x: x[0], reverse=True)  # 从高到低排序买价
-    #     else:
-    #         price_levels = list(zip(current_lob['AskPrice1':'AskPrice10'], current_lob['AskVolume1':'AskVolume10']))
-    #         price_levels.sort(key=lambda x: x[0])  # 从低到高排序卖价
-
-    #     for i, (price, volume) in enumerate(price_levels[:self.max_price_levels]):
-    #         if adjusted_size <= 0:
-    #             break
-
-    #         # 计算在这个价格级别的订单大小
-    #         level_liquidity = volume
-    #         order_size = min(adjusted_size, level_liquidity, max(self.min_order_size, adjusted_size * 0.3))
-    #         order_size = int(round(order_size / 100) * 100)  # 取整到100的倍数
-
-    #         if order_size >= self.min_order_size:
-    #             # 根据预测和之前的LOB调整价格
-    #             adjusted_price = self.adjust_price(price, side, prediction, prev_lob)
-    #             orders.append((side, order_size, round(adjusted_price, 2)))
-    #             adjusted_size -= order_size
-
-    #     return orders
-    
     def split_orders(self, current_lob, prev_lob, tradable_size, remaining_time, target_position, t, side, prediction):
         orders = []
         remaining_size = abs(tradable_size)
+        adjusted_size = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction)
         
-        total_trade_volume = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction )
-
-        # # 确保总交易量至少为1000，并且是100的倍数
-        # if remaining_size < 1000 or remaining_size % 100 != 0:
-        #     return orders
-
-        # 计算每批订单的大小
-        batch_sizes = self.calculate_batch_sizes(total_trade_volume)
-
         if side == "buy":
             price_levels = list(zip(current_lob['BidPrice1':'BidPrice10'], current_lob['BidVolume1':'BidVolume10']))
             price_levels.sort(key=lambda x: x[0], reverse=True)  # 从高到低排序买价
@@ -280,68 +243,24 @@ class OrderStrategy:
             price_levels = list(zip(current_lob['AskPrice1':'AskPrice10'], current_lob['AskVolume1':'AskVolume10']))
             price_levels.sort(key=lambda x: x[0])  # 从低到高排序卖价
 
-        for i, batch_size in enumerate(batch_sizes):
-            if i >= len(price_levels):
+        for i, (price, volume) in enumerate(price_levels[:self.max_price_levels]):
+            if adjusted_size <= 0:
                 break
 
-            price, volume = price_levels[i]
-            
-            # 第一批订单使用更保守的价格
-            if i == 0:
-                adjusted_price = self.adjust_price_conservative(price, side, prev_lob)
-            else:
-                adjusted_price = self.adjust_price_aggressive(price, side, prediction, prev_lob)
+            # 计算在这个价格级别的订单大小
+            level_liquidity = volume
+            order_size = min(adjusted_size, level_liquidity, max(self.min_order_size, adjusted_size * 0.3))
+            order_size = int(round(order_size / 100) * 100)  # 取整到100的倍数
 
-            # 确保价格是2位小数
-            adjusted_price = round(adjusted_price, 2)
-
-            orders.append((side, batch_size, adjusted_price))
+            if order_size >= self.min_order_size:
+                # 根据预测和之前的LOB调整价格
+                adjusted_price = self.adjust_price(price, side, prediction, prev_lob)
+                orders.append((side, order_size, round(adjusted_price, 2)))
+                adjusted_size -= order_size
 
         return orders
-
-    def calculate_batch_sizes(self, total_size):
-        batch_sizes = []
-        remaining = total_size
-
-        # 第一批：50%的总量，但不少于1000，并且是100的倍数
-        first_batch = max(int(total_size * 0.5) // 100 * 100, 1000)
-        batch_sizes.append(first_batch)
-        remaining -= first_batch
-
-        # 如果还有剩余，分配第二批
-        if remaining >= 1000:
-            second_batch = min(remaining, max(int(total_size * 0.3) // 100 * 100, 1000))
-            batch_sizes.append(second_batch)
-            remaining -= second_batch
-
-        # 如果还有剩余，分配第三批
-        if remaining >= 1000:
-            batch_sizes.append(remaining // 100 * 100)  # 确保是100的倍数
-
-        return batch_sizes
-
-    # def adjust_price_conservative(self, base_price, side, prev_lob):
-    #     # 更保守的价格调整，更接近当前市场价格
-    #     if side == "buy":
-    #         return round(min(base_price, prev_lob['As
-    def adjust_price_conservative(self, base_price, side, prev_lob):
-        # 更保守的价格调整，更接近当前市场价格
-        if side == "buy":
-            return round(min(base_price, prev_lob['AskPrice1']), 2)
-        else:  # sell
-            return round(max(base_price, prev_lob['BidPrice1']), 2)
-
-    def adjust_price_aggressive(self, base_price, side, prediction, prev_lob):
-        # 更激进的价格调整，考虑预测因素
-        if side == "buy":
-            prev_ask = prev_lob['AskPrice1']
-            price_adjustment = self.alpha * prediction * (base_price - prev_ask)
-            return round(base_price + price_adjustment, 2)
-        else:  # sell
-            prev_bid = prev_lob['BidPrice1']
-            price_adjustment = self.alpha * prediction * (prev_bid - base_price)
-            return round(base_price - price_adjustment, 2)
     
+
     def adjust_price(self, base_price, side, prediction, prev_lob):
         # 根据预测和之前的LOB调整价格
         if side == "buy":
@@ -381,6 +300,27 @@ class OrderStrategy:
         size = min(size, base_size)
         
         return max(size, self.start_size)
+
+    # def calculate_order_price(self, mid_price, spread, side, prediction, t):
+    #     # 基础价格：买入时略低于中间价，卖出时略高于中间价
+    #     base_price = mid_price
+        
+    #     if t < 1500:
+    #         price_adjustment = spread * 0.3
+    #     else:
+    #         price_adjustment = spread * 0.7
+            
+        
+    #     logger.debug(f"mid price: {mid_price}, prediction: {prediction}")
+        
+    #     # TODO 如果是买的话，就低价速速买进
+    #     if side == "buy":
+    #         price = base_price + price_adjustment
+    #     else:  # sell
+    #         price = base_price - price_adjustment
+        
+    #     # 确保价格在合理范围内
+    #     return price
 
     def get_order_params(self, lob, remain_position, t, side, prediction):
         mid_price = (lob["AskPrice1"] * lob['AskVolume1'] + lob["BidPrice1"] * lob['BidVolume1']) / (lob['AskVolume1'] + lob['BidVolume1'])
@@ -870,8 +810,8 @@ class LSTMTradingStrategy(BaseStrategy):
         try:
             logger.info(f"Work time: {round(t)}")
             await self.update_market_data(api, token_ub)
+            await self.execute_trades(api, token_ub, self._cache_user_info, t)
             if int(t) % 10 == 0:
-                self._cache_lobs
                 logger.debug("Begin cancel")
                 index_list = await self.cancel_all_order(api, token_ub)
                 cancel_response = await asyncio.gather(*[api.sendCancel(token_ub, index[0], t, index[1]) for index in index_list])
@@ -881,7 +821,6 @@ class LSTMTradingStrategy(BaseStrategy):
                         logger.info(f"Cancelled order for {order_info[0]}: {order_info[1]}")
                     else:
                         logger.error(f"Failed to cancel order for {order_info[0]}: {resp}\n {order_info}, {t}")
-            await self.execute_trades(api, token_ub, self._cache_user_info, t)
 
         except Exception as e:
             logger.error(f"Error in work method: {str(e)}")

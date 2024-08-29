@@ -196,3 +196,59 @@ class CancelOrderStrategy:
 
         except Exception as e:
             logger.error(f"Error in update_and_cancel: {str(e)}")
+
+
+class NaiveOrderStrategy:
+    def __init__(self, time_window=3000, start_size = 100,):
+        self.time_window = time_window
+        self.start_size = start_size
+
+    def calculate_order_size(self, tradable_size, t, prediction):
+        # 基础订单大小就是remain_position的绝对值
+        base_size = abs(tradable_size)
+        
+        # 时间因子：随着时间推移逐渐增加订单大小
+        # TODO softmax
+        
+        time_factor = np.sqrt(t / self.time_window)
+
+        # 计算最终订单大小
+        size = base_size * time_factor
+        
+        # 四舍五入到最接近的100的倍数
+        size = int(round(size / 100) * 100)
+        
+        # 确保订单大小不超过需要交易的数量
+        size = min(size, base_size)
+        
+        return max(size, self.start_size)
+
+    def calculate_order_price(self, mid_price, spread, side, prediction, t):
+        # 基础价格：买入时略低于中间价，卖出时略高于中间价
+        base_price = mid_price
+        
+        if t < 1500:
+            price_adjustment = spread * 0.3
+        else:
+            price_adjustment = spread * 0.7
+            
+        
+        logger.debug(f"mid price: {mid_price}, prediction: {prediction}")
+        
+        # TODO 如果是买的话，就低价速速买进
+        if side == "buy":
+            price = base_price + price_adjustment
+        else:  # sell
+            price = base_price - price_adjustment
+        
+        # 确保价格在合理范围内
+        return price
+
+    def get_order_params(self, lob, remain_position, t, side, prediction):
+        mid_price = (lob["AskPrice1"] * lob['AskVolume1'] + lob["BidPrice1"] * lob['BidVolume1']) / (lob['AskVolume1'] + lob['BidVolume1'])
+        spread = lob["AskPrice1"] - lob["BidPrice1"]
+        
+        size = self.calculate_order_size(remain_position, t, prediction)
+        price = self.calculate_order_price(mid_price, spread, side, prediction, t)
+        
+        return side, size , round(price,2)

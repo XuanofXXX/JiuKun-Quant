@@ -133,6 +133,7 @@ cython_debug/
 .vscode/
 .DS_Store
 data/
+analysis/
 snapshots/
 *.zip
 *.csv

@@ -6,6 +6,7 @@ import time
 import pandas as pd
 from datetime import datetime
 from utils.logger_config import setup_logger
+from functools import wraps
 
 logger = setup_logger('data_collector')
 
@@ -57,6 +58,32 @@ def convert_api_to_df_format(api_response):
         df = pd.DataFrame(base_data)
         return df
 
+
+def async_retry(max_retries=3, base_delay=0.05, max_delay=0.5):
+    def decorator(func):
+        @wraps(func)
+        async def wrapper(*args, **kwargs):
+            retries = 0
+            while retries < max_retries:
+                try:
+                    return await func(*args, **kwargs)
+                except Exception as e:
+                    retries += 1
+                    if retries == max_retries:
+                        logging.error(f"Failed after {max_retries} retries. Error: {str(e)}")
+                        raise
+                    
+                    # 计算延迟时间，使用指数退避策略
+                    delay = min(base_delay * (1.5 ** (retries - 1)), max_delay)
+                    # 添加一些随机性以避免多个请求同时重试
+                    jitter = random.uniform(0, 0.1 * delay)
+                    total_delay = delay + jitter
+                    
+                    logging.warning(f"Attempt {retries} failed. Retrying in {total_delay:.4f} seconds. Error: {str(e)}")
+                    await asyncio.sleep(total_delay)
+        return wrapper
+    return decorator
+
 class AsyncInterfaceClass:
     def __init__(self, domain_name):
         self.domain_name = domain_name
@@ -71,6 +98,7 @@ class AsyncInterfaceClass:
             await self.session.close()
             self.session = None
 
+    @async_retry(10)
     async def send_request(self, endpoint, data):
         if not self.session:
             await self.create_session()
@@ -245,7 +273,7 @@ class DataCollector:
                 while self.ConvertToSimTime_us(self.day) < s:
                     await asyncio.sleep(0.001)
                 t = self.ConvertToSimTime_us(self.day)
-                logger.info(f"Work Time: {s} {t}")
+                # logger.info(f"Work Time: {s} {t}")
                 if t <= SimTimeLen:
                     await self.collect_data(t)
             
