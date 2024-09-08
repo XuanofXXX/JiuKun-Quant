@@ -167,189 +167,131 @@ class LSTMModel(nn.Module):
         return out
 
 class OrderStrategy:
-    def __init__(self, time_window=3000, start_size = 100, alpha=0.1, beta=0.2, gamma=0.3):
+    def __init__(self, time_window=3000, start_size=100, alpha=0.1, beta=0.2, gamma=0.3):
         self.time_window = time_window
         self.start_size = start_size
-        self.alpha = alpha  # 价格影响因子
-        self.beta = beta    # 时间影响因子
-        self.gamma = gamma  # 预测影响因子
-        self.min_order_size = 100  # 最小订单大小
-        self.max_price_levels = 3 # 最多使用的价格档位数
+        self.alpha = alpha
+        self.beta = beta
+        self.gamma = gamma
+        self.min_order_size = 100
+        self.max_price_levels = 3
 
-    # def split_orders(self, current_lob, prev_lob, tradable_size, remaining_time, target_position, t, side, prediction):
-    #     orders = []
-    #     remaining_size = abs(tradable_size)
-    #     adjusted_size = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction)
-        
-    #     if side == "buy":
-    #         price_levels = list(zip(current_lob['BidPrice1':'BidPrice10'], current_lob['BidVolume1':'BidVolume10']))
-    #         price_levels.sort(key=lambda x: x[0], reverse=True)  # 从高到低排序买价
-    #     else:
-    #         price_levels = list(zip(current_lob['AskPrice1':'AskPrice10'], current_lob['AskVolume1':'AskVolume10']))
-    #         price_levels.sort(key=lambda x: x[0])  # 从低到高排序卖价
-
-    #     for i, (price, volume) in enumerate(price_levels[:self.max_price_levels]):
-    #         if adjusted_size <= 0:
-    #             break
-
-    #         # 计算在这个价格级别的订单大小
-    #         level_liquidity = volume
-    #         order_size = min(adjusted_size, level_liquidity, max(self.min_order_size, adjusted_size * 0.3))
-    #         order_size = int(round(order_size / 100) * 100)  # 取整到100的倍数
-
-    #         if order_size >= self.min_order_size:
-    #             # 根据预测和之前的LOB调整价格
-    #             adjusted_price = self.adjust_price(price, side, prediction, prev_lob)
-    #             orders.append((side, order_size, round(adjusted_price, 2)))
-    #             adjusted_size -= order_size
-
-    #     return orders
-    
-    def split_orders(self, current_lob, prev_lob, tradable_size, remaining_time, target_position, t, side, prediction):
+    def split_orders(self, current_lob, prev_lob, tradable_size, remaining_time, target_position, t, side, prediction, midprice_cache):
         orders = []
         remaining_size = abs(tradable_size)
         
-        total_trade_volume = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction )
+        total_trade_volume = self.calculate_order_size(tradable_size, remaining_time, target_position, prediction, midprice_cache)
 
-        # # 确保总交易量至少为1000，并且是100的倍数
-        # if remaining_size < 1000 or remaining_size % 100 != 0:
-        #     return orders
-
-        # 计算每批订单的大小
         batch_sizes = self.calculate_batch_sizes(total_trade_volume)
         logger.debug(f"total_trade_volume: {total_trade_volume}")
 
         if side == "buy":
             price_levels = list(zip(current_lob['BidPrice1':'BidPrice10'], current_lob['BidVolume1':'BidVolume10']))
-            price_levels.sort(key=lambda x: x[0], reverse=True)  # 从高到低排序买价
+            price_levels.sort(key=lambda x: x[0], reverse=True)
         else:
             price_levels = list(zip(current_lob['AskPrice1':'AskPrice10'], current_lob['AskVolume1':'AskVolume10']))
-            price_levels.sort(key=lambda x: x[0])  # 从低到高排序卖价
+            price_levels.sort(key=lambda x: x[0])
         
         for i, batch_size in enumerate(batch_sizes):
             if i >= len(price_levels):
                 break
 
-            # price, volume = price_levels[i]
             spread = current_lob['AskPrice1'] - current_lob['BidPrice1']
             
-            # 第一批订单使用更保守的价格
-            # TODO 调一下分批的价格和量
             if i == 0:
                 price = current_lob['BidPrice1'] if side == "buy" else current_lob['AskPrice1']
                 adjusted_price = self.adjust_price_conservative(price, side, prev_lob)
             elif i == 1:
-                price = current_lob['BidPrice2'] if side == "buy" else current_lob['AskPrice2']
-                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob)
+                price = (current_lob['AskPrice2'] * current_lob['AskVolume2'] + current_lob['BidPrice2'] * current_lob['BidVolume2']) / (current_lob['BidVolume2'] + current_lob['AskVolume2'])
+                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob, i)
             else:
-                # todo 赌的可能有点大
-                price = current_lob['BidPrice5'] if side == "buy" else current_lob['AskPrice5']
-                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob)
-            
+                price = (current_lob['AskPrice2'] * current_lob['AskVolume2'] + current_lob['BidPrice2'] * current_lob['BidVolume2']) / (current_lob['BidVolume2'] + current_lob['AskVolume2'])
+                adjusted_price = self.adjust_price_aggressive(price, spread, side, prediction, prev_lob, i)
 
-            # 确保价格是2位小数
             adjusted_price = round(adjusted_price, 2)
             orders.append((side, batch_size, adjusted_price))
 
-        
-        logger.debug(f"拆单之后的单子：{(side, batch_size, adjusted_price)}")
+        logger.debug(f"拆单之后的单子{len(orders)}: {orders}")
         return orders
 
     def calculate_batch_sizes(self, total_size):
         batch_sizes = []
         remaining = total_size
 
-        # 第一批：40%的总量，但不少于100，并且是100的倍数
         first_batch = max(int(total_size * 0.4) // 100 * 100, 100)
         batch_sizes.append(first_batch)
         remaining -= first_batch
 
-        # 如果还有剩余，分配第二批
-        if remaining >= 1000:
+        if remaining >= 0:
             second_batch = min(remaining, max(int(total_size * 0.3) // 100 * 100, 1000))
             batch_sizes.append(second_batch)
             remaining -= second_batch
 
-        # 如果还有剩余，分配第三批
-        if remaining >= 1000:
-            batch_sizes.append(remaining // 100 * 100)  # 确保是100的倍数
+        if remaining >= 0:
+            batch_sizes.append(remaining // 100 * 100)
 
         return batch_sizes
 
-    # todo 更迅速地把货出完
     def adjust_price_conservative(self, base_price, side, prev_lob):
-        # 更保守的价格调整，更接近当前市场价格
         if side == "buy":
-            # return round(min(base_price, prev_lob['AskPrice1']), 2)
             return round(max(base_price, prev_lob['AskPrice1']), 2)
-        else:  # sell
-            # return round(max(base_price, prev_lob['BidPrice1']), 2)
+        else:
             return round(min(base_price, prev_lob['BidPrice1']), 2)
 
-    def adjust_price_aggressive(self, base_price, spread, side, prediction, prev_lob):
-        # 更激进的价格调整，考虑预测因素
-        price_adjustment = 0.5 * spread
+    def adjust_price_aggressive(self, base_price, spread, side, prediction, prev_lob, idx):
+        alpha = 0.5 if idx == 1 else 0.6
+        price_adjustment = alpha * spread
         logger.debug(f"aggressive price_adjustment: {price_adjustment}")
         if side == "buy":
-            # prev_ask = prev_lob['AskPrice2']
-            # price_adjustment = self.alpha * prediction * (base_price - prev_ask)
             return round(base_price - price_adjustment, 2)
-        else:  # sell
-            # prev_bid = prev_lob['BidPrice2']
-            # price_adjustment = self.alpha * prediction * (prev_bid - base_price)
-            # price_adjustment = 0.5 * spread
-            # logger.debug(f"aggressive price_adjustment: {price_adjustment}")
+        else:
             return round(base_price + price_adjustment, 2)
     
-    def adjust_price(self, base_price, side, prediction, prev_lob):
-        # 根据预测和之前的LOB调整价格
-        if side == "buy":
-            prev_ask = prev_lob['AskPrice1']
-            price_adjustment = prediction * (base_price - prev_ask)
-            price = base_price + price_adjustment
-        else:  # sell
-            prev_bid = prev_lob['BidPrice1']
-            price_adjustment = prediction * (prev_bid - base_price)
-            price = base_price - price_adjustment
-
-        logger.debug(f"base_price: {base_price}, prediction: {prediction}, adjusted_price: {price}")
-        return price
-
-    def calculate_order_size(self, tradable_size, remaining_time, target_position, prediction):
-        # 基础订单大小
+    def calculate_order_size(self, tradable_size, remaining_time, target_position, prediction, midprice_cache):
         base_size = abs(tradable_size)
-        
-        # 时间因子：随着剩余时间减少，增加订单大小
         time_factor = max(0.01, 1 - (remaining_time / self.time_window))
-        
-        # 目标仓位因子：距离目标仓位越远，订单大小越小
         position_factor = abs(target_position) / (abs(target_position) + abs(tradable_size))
-        
-        # 预测因子：根据预测的强度调整订单大小
-        # todo 这里的abs(prediction) * 100是为了将预测值映射到0.5-1.5之间
         prediction_factor = 0.5 + self.gamma * abs(prediction) * 100
         
-        # 计算最终订单大小
-        size = base_size * time_factor * position_factor * prediction_factor
+        midprice_list = list(midprice_cache)
+        current_midprice = midprice_list[-1][1] if midprice_list else None
+        recent_500 = [price for _, price in midprice_list[-500:]]
+        recent_2000 = [price for _, price in midprice_list[-2000:]]
+        recent_1000 = [price for _, price in midprice_list[-1000:]]
+        recent_200 = [price for _, price in midprice_list[-200:]]
+
+        price_factor = 1.0
+        side = "buy" if target_position > 0 else "sell"
+        if current_midprice is not None:
+            if side == "buy":
+                if len(recent_2000) >= 2000 and current_midprice <= min(recent_2000):
+                    price_factor = 6.0
+                elif len(recent_1000) >= 1000 and current_midprice <= min(recent_1000):
+                    price_factor = 5.0
+                elif len(recent_500) >= 500 and current_midprice <= min(recent_500):
+                    price_factor = 3.0
+                elif len(recent_200) >= 200 and current_midprice <= min(recent_200):
+                    price_factor = 2.0
+            else:
+                if len(recent_2000) >= 2000 and current_midprice >= max(recent_2000):
+                    price_factor = 6.0
+                elif len(recent_1000) >= 1000 and current_midprice >= max(recent_1000):
+                    price_factor = 5.0
+                elif len(recent_500) >= 500 and current_midprice >= max(recent_500):
+                    price_factor = 3.0
+                elif len(recent_200) >= 200 and current_midprice >= max(recent_200):
+                    price_factor = 2.0
+
+        size = base_size * time_factor * position_factor * prediction_factor * price_factor
         
-        logger.debug(f"calculating order size: base_size: {base_size}, time_factor: {time_factor}, position_factor: {position_factor}, prediction_factor: {prediction_factor}, calculate size:{size}")
+        logger.debug(f"calculating order size: base_size: {base_size}, time_factor: {time_factor}, "
+                    f"position_factor: {position_factor}, prediction_factor: {prediction_factor}, "
+                    f"price_factor: {price_factor}, calculate size:{size} , side:{side}")
         
-        # 四舍五入到最接近的100的倍数
         size = int(round(size / 100) * 100)
-        
-        # 确保订单大小不超过需要交易的数量
         size = min(size, base_size)
         
         return max(size, self.start_size)
-
-    def get_order_params(self, lob, remain_position, t, side, prediction):
-        mid_price = (lob["AskPrice1"] * lob['AskVolume1'] + lob["BidPrice1"] * lob['BidVolume1']) / (lob['AskVolume1'] + lob['BidVolume1'])
-        spread = lob["AskPrice1"] - lob["BidPrice1"]
-        
-        size = self.calculate_order_size(remain_position, t, prediction)
-        price = self.calculate_order_price(mid_price, spread, side, prediction, t)
-        
-        return side, size , round(price,2)
 
 class LSTMTradingStrategy:
     def __init__(self, model_path="./trained_lstm_stock_model_180.pth", lookback_period=20, sequence_length=10):
@@ -358,6 +300,7 @@ class LSTMTradingStrategy:
         self._cache_lobs = None
         self._cache_user_info = None
         self._cache_past_trade_price = None
+        self._cache_twap_vwap = None
         # Tick  StockID   Price Volume OrderIndex
         # 0   2716  UBIQ001    6.49    100     153027
         # ...
@@ -373,16 +316,18 @@ class LSTMTradingStrategy:
         self.initial_cooldown = 40
         self.final_cooldown = 5  # 最终冷却期更短
         # TODO 可以提高一点阈值，来降低初期的爆发交易量
-        self.initial_threshold = 0.01
-        self.final_threshold = 0.001  # 最终阈值更低
+        self.initial_threshold = 0.05
+        # self.final_threshold = 0.001  # 最终阈值更低
         self.max_order_size_ratio = 0.2  # 初始最大订单比例
         self.emergency_time = 2700  # 紧急模式触发时间（交易日的最后300秒）
         self.critical_emergency_time = 2950
         
         self.last_trade_time = {}
         self.trade_count = {}
+        self.midprice_cache = {}
+        self.midprice_cache_size = 2000
         
-        # Dedeprecated var
+        # Deprecated var
         self.target_positions = []
         self.price_history = {}
         self.volume_history = {}
@@ -504,35 +449,6 @@ class LSTMTradingStrategy:
         
         factors['trend_strength'] = calculate_trend_strength(price_series, window_medium)
         
-        # expected_factors  = [
-        #     'Tick', 'StockID',
-        #     'momentum_short',
-        #     'momentum_medium',
-        #     'momentum_long',
-        #     'ma_short',
-        #     'ma_medium',
-        #     'ma_long',
-        #     'ma_cross_short_medium',
-        #     'ma_cross_short_long',
-        #     'ma_cross_medium_long',
-        #     'volatility_short',
-        #     'volatility_medium',
-        #     'volatility_long',
-        #     'rsi',
-        #     'bollinger_upper',
-        #     'bollinger_lower',
-        #     'bollinger_percent',
-        #     'price_acceleration',
-        #     'volume_momentum',
-        #     'volume_ma_ratio',
-        #     'price_volume_corr',
-        #     'mfi',
-        #     'atr',
-        #     'channel_upper',
-        #     'channel_lower',
-        #     'channel_position',
-        #     'trend_strength'
-        # ]
         expected_factors  = [
             'Tick', 'StockID',
             'mfi', 'rsi',
@@ -561,13 +477,11 @@ class LSTMTradingStrategy:
     def initialize_instruments(self, instruments):
         self.instruments = instruments
         for instrument in instruments:
-            self.price_history[instrument] = deque(maxlen=self.lookback_period)
-            self.volume_history[instrument] = deque(maxlen=self.lookback_period)
-            self.order_book_history[instrument] = deque(maxlen=self.lookback_period)
-            self.factor_history[instrument] = deque(maxlen=self.sequence_length)
+            self.midprice_cache[instrument] = deque(maxlen=self.midprice_cache_size)
+        logger.debug(f"initialize_instruments, self.instruments: {self.instruments}")
     
     @async_timer
-    async def update_market_data(self, api, token_ub):
+    async def update_market_data(self, api, token_ub, t):
         try:
             # 创建两组并发请求，每组3个
             tasks_lob = [api.sendGetAllLimitOrderBooks(token_ub) for _ in range(3)]
@@ -600,28 +514,47 @@ class LSTMTradingStrategy:
                 raise Exception("Failed to get either LOB or Trades data")
             
             new_data = convert_LOB_response_to_df_format(lob_result["lobs"])
+            logger.debug(f"the new_data is :{new_data}")
             new_data['vwap'] = new_data['TotalTradeValue'] / new_data['TotalTradeVolume']
             
-            max_tick = new_data['Tick'].max()
+            mid_price_series = (new_data["AskPrice1"] * new_data['AskVolume1'] + new_data["BidPrice1"] * new_data['BidVolume1']) / (new_data['AskVolume1'] + new_data['BidVolume1'])
+            
+            logger.debug(f"mid_price_series: {mid_price_series}")
+            self._cache_user_info = convert_userinfo_response_to_df_format(user_info_result['rows'], t)
+            
+            if self._cache_twap_vwap is None:
+                new_twap_vwap = new_data[['StockID', 'Tick', 'twap', 'vwap']].copy()
+                new_twap_vwap['MidPrice'] = mid_price_series
+                self._cache_twap_vwap = new_twap_vwap
             
             if self._cache_lobs is None:
                 self._cache_lobs = new_data
-                logger.info(f"Added {len(new_data)} new records at tick: {new_data['Tick'].max()}.")
-                return
             
-            self._cache_user_info = convert_userinfo_response_to_df_format(user_info_result['rows'], max_tick)
             # 使用更高效的方法更新数据
             max_existing_tick = self._cache_lobs['Tick'].max()
-            new_data = new_data[new_data['Tick'] > max_existing_tick]
+            lob_new_data = new_data[new_data['Tick'] > max_existing_tick]
             
-            if not new_data.empty:
-                self._cache_lobs = pd.concat([self._cache_lobs, new_data], ignore_index=True)
-                logger.info(f"Added {len(new_data)} new records at tick: {new_data['Tick'].max()}.")
+            if not lob_new_data.empty:
+                self._cache_lobs = pd.concat([self._cache_lobs, lob_new_data], ignore_index=True)
+                logger.info(f"Added {len(lob_new_data)} new records at tick: {lob_new_data['Tick'].max()}.")
+            
+            max_existing_tick_twap = self._cache_twap_vwap['Tick'].max()
+            twap_new_data = new_data[new_data['Tick'] > max_existing_tick_twap]
+            
+            if not twap_new_data.empty:
+                new_twap_vwap = twap_new_data[['StockID', 'Tick', 'twap', 'vwap']].copy()
+                new_twap_vwap['MidPrice'] = mid_price_series
+                self._cache_twap_vwap = pd.concat([self._cache_twap_vwap, new_twap_vwap], ignore_index=True)
+                logger.info(f"Added {len(twap_new_data)} new twap/vwap records at tick: {twap_new_data['Tick'].max()}.")
             
             # 使用更高效的方法保留最新数据
             self._cache_lobs = (self._cache_lobs.groupby('StockID')
                                 .apply(lambda x: x.nlargest(self.lookback_period, 'Tick'))
                                 .reset_index(drop=True))
+            
+            logger.debug(f"the new_twap_vwap is :{new_twap_vwap}")
+            logger.debug(f"current twap_vwap_df.shape :{self._cache_twap_vwap.shape}")
+            logger.debug(f"current twap_vwap_df.head :{self._cache_twap_vwap.head()}")
 
         except Exception as e:
             logger.error(f"Error updating market data: {str(e)}")
@@ -641,23 +574,30 @@ class LSTMTradingStrategy:
         """计算动态参数"""
         progress = min(t / 3000, 1)  # 交易日进度，范围 0 到 1
         cooldown = int(self.initial_cooldown - (self.initial_cooldown - self.final_cooldown) * progress)
-        threshold = self.initial_threshold - (self.initial_threshold - self.final_threshold) * progress
+        # threshold = self.initial_threshold - (self.initial_threshold - self.final_threshold) * progress
+        threshold = self.initial_threshold
         # order_size_ratio = self.max_order_size_ratio + (1 - self.max_order_size_ratio) * progress
         return cooldown, threshold
 
-    def pre_processing(self):
+    def pre_processing(self, t):
         stock_df = self._cache_lobs
         factors_df = self.calculate_factors(stock_df)
         input_tensor = self.factorDF2Tensor(factors_df)
+        
         with torch.no_grad():
             predictions = self.model(input_tensor).numpy().flatten()
+            predictions = predictions / 10000
+        logger.debug(f"predictions: {predictions}, its shape:{predictions.shape}")
+        logger.debug(f"self.instruments: {self.instruments}, its shape:{len(self.instruments)}")
         
         prediction_df = pd.DataFrame({
-                'instrument': self.instruments,
+                'Tick': t ,
+                'StockID': self.instruments,
                 'instrument_id': [int(instr[-3:]) for instr in self.instruments],
-                'prediction': predictions / 10000
+                'prediction': predictions
             })
-            
+        
+        logger.debug(f"prediction is init")
         # Add target position information
         user_info_df = self._cache_user_info
         logger.debug(f'user info df: {user_info_df}')
@@ -665,7 +605,28 @@ class LSTMTradingStrategy:
                                             left_on='instrument_id', right_index=True)
         
         prediction_df['tradable_volume'] = prediction_df['remain_volume'] - prediction_df['frozen_volume']
-        logger.debug(f"Prediction_df columns: {prediction_df.columns}")
+        
+        # 获取价格数据
+        price_data = self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t][['StockID', 'MidPrice', 'twap', 'vwap']]
+
+        # 如果当前 tick 没有数据，找最近的 tick
+        if price_data.empty:
+            logger.warning(f"No price data for tick {t}, searching for the nearest tick")
+            nearest_tick = self._cache_twap_vwap['Tick'].iloc[(self._cache_twap_vwap['Tick'] - t).abs().argsort()[:1]].values[0]
+            price_data = self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == nearest_tick][['StockID', 'MidPrice', 'twap', 'vwap']]
+            logger.info(f"Using price data from tick {nearest_tick}")
+
+        # 合并价格数据
+        prediction_df = prediction_df.merge(price_data, on='StockID', how='left')
+
+        
+        # prediction_df['MidPrice'] = self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t]['MidPrice']
+        # prediction_df['twap'] = self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t]['twap']
+        # prediction_df['vwap'] = self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t]['vwap']
+        
+        logger.debug(f"self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t]['MidPrice'] {self._cache_twap_vwap[self._cache_twap_vwap['Tick'] == t]['MidPrice']}")
+        logger.debug(f"赋值twap时候, self._cache_twap_vwap: {self._cache_twap_vwap}")
+        logger.debug(f"prediction_df: {prediction_df}")
         return stock_df, prediction_df
 
     def choose_stocks(self, prediction_df: pd.DataFrame, t):
@@ -674,25 +635,44 @@ class LSTMTradingStrategy:
             'instrument', 'instrument_id', 'prediction', 'remain_volume',
             'target_volume', 'frozen_volume', 'tradable_volume'
         '''
-        
         cooldown, threshold = self.calculate_dynamic_params(t)
-
         # TODO 对机会的定义更严格
         # 1. 看过去的10|20|30|100个成交金额
         # 2. 过去波动是否剧烈
         # 3. 均线穿越的策略（VWAP和twap）
         # 4. VWAP， twap
         # 5. 综合的策略，比如5满足3即可
-        def can_trade(instrument, prediction, tradable_volume, target_volume):
+        def is_good_price(instrument, current_mid_price, side, window_size=30, nlargest=3):
+            recent_mid_prices = self._cache_twap_vwap[self._cache_twap_vwap['StockID'] == instrument]['MidPrice'].tail(window_size)
+            logger.debug(f"recent_mid_prices: {recent_mid_prices}, current_mid_price: {current_mid_price}")
+            if len(recent_mid_prices) < window_size:
+                return False  # 如果没有足够的历史数据，我们认为这不是一个好的机会
+            if side == 'buy':
+                return current_mid_price <= sorted(recent_mid_prices)[nlargest]  # 检查是否在前3低
+            else:  # sell
+                return current_mid_price >= sorted(recent_mid_prices, reverse=True)[nlargest]  # 检查是否在前3高
+        
+        def can_trade(instrument, prediction, tradable_volume, target_volume, current_mid_price, side):
             last_trade = self.last_trade_time.get(instrument, 0)
+            logger.debug(f"last_trade: {last_trade}")
             if t - last_trade < cooldown:
+                logger.debug(f"can't trade: in the cooldown")
                 return False
             if t > self.critical_emergency_time:
                 return True
             if abs(prediction) <= threshold:
+                logger.debug(f"can't trade: prediction is too low")
                 return False
-            # return abs(tradable_volume) / abs(target_volume) > 0.1  # 如果剩余交易量占目标的10%以上
-            return False
+            # if not is_good_price(instrument, current_mid_price, side, 30, 3):
+            #     logger.debug(f"can't trade: not a good price")
+            #     return False
+            if not is_good_price(instrument, current_mid_price, side, 200, 10):
+                logger.debug(f"can't trade: not a good price")
+                return False
+            # if not is_good_price(instrument, current_mid_price, side, 5, 1):
+            #     logger.debug(f"can't trade: not a good price")
+            #     return False
+            return True
 
         # 紧急模式：如果接近收盘且还有大量未完成的目标仓位
         is_emergency = t >= self.emergency_time
@@ -700,18 +680,16 @@ class LSTMTradingStrategy:
             logger.warning(f"Entering emergency mode at tick {t}")
             threshold *= 0.5  # 在紧急模式下降低阈值
         
-        def calculate_combined_score(row, current_price, prediction, model_weight, twap_weight, vwap_weight):
-            twap_diff = (current_price - row['twap']) / row['twap']
-            vwap_diff = (current_price - row['vwap']) / row['vwap']
-            
-            if row['target_volume'] > 0:  # 买入
-                return model_weight * prediction - twap_weight * twap_diff - vwap_weight * vwap_diff
-            else:  # 卖出
-                return model_weight * prediction + twap_weight * twap_diff + vwap_weight * vwap_diff
-        
         prediction_df['valid_trade'] = prediction_df.apply(
             lambda row: (
-                (is_emergency or can_trade(row['instrument'], row['prediction'], row['tradable_volume'], row['target_volume'])) and
+                (is_emergency or can_trade(
+                    row['StockID'], 
+                    row['prediction'], 
+                    row['tradable_volume'], 
+                    row['target_volume'],
+                    row['MidPrice'],
+                    'buy' if row['target_volume'] > 0 else 'sell'
+                )) and
                 (
                     (row['target_volume'] > 0 and row['tradable_volume'] > 0) or
                     (row['target_volume'] < 0 and row['tradable_volume'] < 0)
@@ -735,7 +713,7 @@ class LSTMTradingStrategy:
         logger.debug(f"Valid trades: {len(valid_trades)}")
         logger.debug(f"Buy candidates: {len(buy_candidates)}")
         logger.debug(f"Sell candidates: {len(sell_candidates)}")
-        
+        logger.debug(f"Prediction_df columns: {prediction_df.columns}")
         return buy_candidates, sell_candidates
 
     @async_timer
@@ -744,7 +722,7 @@ class LSTMTradingStrategy:
             if isinstance(t, float):
                 t = int(t)
             remaining_time = max(0, 3000 - t)
-            stock_df, prediction_df = self.pre_processing()
+            stock_df, prediction_df = self.pre_processing(t)
             buy_candidates, sell_candidates = self.choose_stocks(prediction_df, t)
             
             order_tasks = []
@@ -753,7 +731,8 @@ class LSTMTradingStrategy:
 
             for side, candidates in [("buy", buy_candidates), ("sell", sell_candidates)]:
                 for _, row in candidates.iterrows():
-                    instrument = row['instrument']
+                    
+                    instrument = row['StockID']
                     chosen_stock_list.append(instrument)
                     
                     self.last_trade_time[instrument] = t
@@ -806,7 +785,6 @@ class LSTMTradingStrategy:
     
     async def send_all_order(self, order_list_coroutine, order_info_list):
         results = await asyncio.gather(*order_list_coroutine, return_exceptions=True)
-
         for idx, result in enumerate(results):
             if isinstance(result, Exception):
                 logger.error(f"Order failed: {str(result)}")
@@ -814,6 +792,7 @@ class LSTMTradingStrategy:
                 order_detail = order_info_list[idx]
                 order_index = result['index']
                 logger.info(f"Order placed successfully: {result}")
+                
                 if self._cache_past_trade_price is None:
                     self._cache_past_trade_price = pd.DataFrame(
                         columns=['Tick', 'StockID', 'Price', 'Volume', 'OrderIndex']
@@ -827,7 +806,7 @@ class LSTMTradingStrategy:
                 new_row['Price'] = -new_row['Price'] if new_row['Side'].item() == 'sell' else new_row['Price']
                 new_row = new_row.drop('Side', axis=1)
                 self._cache_past_trade_price = pd.concat([self._cache_past_trade_price, new_row], ignore_index=True)
-                
+                logger.debug(f"updating self._cache_past_trade_price: {self._cache_past_trade_price}")
             elif result["status"] == "Volume Exceeds Target":
                 order_detail = order_info_list[idx]
                 logger.error(f"{result['status']} Order task: {order_detail}")
@@ -852,25 +831,30 @@ class LSTMTradingStrategy:
             order_info = index_list[idx]
             if resp["status"] == "Success":
                 logger.info(f"Cancelled order for {order_info[0]}: {order_info[1]}")
-                self._cache_past_trade_price = self._cache_past_trade_price[self._cache_past_trade_price['index'] != order_info[1]]
+                self._cache_past_trade_price = self._cache_past_trade_price[self._cache_past_trade_price['OrderIndex'] != order_info[1]]
             else:
                 logger.error(f"Failed to cancel order for {order_info[0]}: {resp}\n {order_info}, {t}")
     
     async def work(self, api, token_ub, t):
         try:
             logger.info(f"Work time: {round(t)}")
-            await self.update_market_data(api, token_ub)
+            await self.update_market_data(api, token_ub, t)
+            
             if int(t) % 5 == 0:
                 await self.cancel_all_order(api, token_ub, t)
             await self.execute_trades(api, token_ub, t)
-            logger.debug(f"current past_trade_price_df:{self._cache_past_trade_price}")
-
+            if self._cache_past_trade_price is not None:
+                logger.debug(f"current past_trade_price_df.head :{self._cache_past_trade_price.head()}")
+                logger.debug(f"current past_trade_price_df.shape :{self._cache_past_trade_price.shape}")
         except Exception as e:
             logger.error(f"Error in work method: {str(e)}")
 
     def new_day(self):
+        
         self._cache_lobs = None
         self._cache_user_info = None
+        self._cache_past_trade_price = None
+        self._cache_twap_vwap = None
         self.last_trade_time = {}
         self.trade_count = {}
 
@@ -880,7 +864,7 @@ class AsyncBotsDemoClass:
         self.password = password
         self.api = AsyncInterfaceClass(f"http://8.147.116.35:{port}")
         self.token_ub = None
-        self.instruments = []
+        self.instruments = [f"UBIQ{idx:03}" for idx in range(50) ]
         self.strategy = LSTMTradingStrategy()
 
     async def login(self):
@@ -940,7 +924,7 @@ async def main(username, password):
         while ConvertToSimTime_us(bot.start_time, bot.time_ratio, bot.day, bot.running_time) <= -1:
             await asyncio.sleep(0.1)
         
-        bot.strategy.new_day()
+        
         now = round(ConvertToSimTime_us(bot.start_time, bot.time_ratio, bot.day, bot.running_time))
         for s in range(now, SimTimeLen + endWaitTime):
             while True:
@@ -951,6 +935,7 @@ async def main(username, password):
             if t < SimTimeLen:
                 await bot.work()
         bot.day += 1
+        bot.strategy.new_day()
 
     await bot.api.close_session()
 

@@ -185,7 +185,12 @@ class DataCollector:
     def initialize_file(self):
         timestamp = datetime.fromtimestamp(self.start_time).strftime("%m%d%H")
         filename = f"./snapshots/{timestamp}-day{self.day}_all_stocks.csv"
-        headers = ['Tick', 'StockID'] + [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + ["TotalTradeVolume", "TotalTradeValue"] + ['share_holding', 'orders', 'error_orders', 'order_value','trade_value','target_volume','remain_volume', 'frozen_volume']
+        headers = ['Tick', 'StockID'] + \
+        [f"{side}{typ}{num}" for side in ["Ask", "Bid"] for typ in ["Price", "Volume"] for num in range(1, 11)] + \
+        ["TotalTradeVolume", "TotalTradeValue"] +\
+        ['limit_up_price', 'limit_down_price', 'last_price', 'twap'] + \
+        ['share_holding', 'orders', 'error_orders', 'order_value'] + \
+        ['trade_value','target_volume','remain_volume', 'frozen_volume']
         
         logger.debug(f"Init: header:{headers}")
         
@@ -236,6 +241,10 @@ class DataCollector:
                     row.extend(lob["bidvolume"])
                     row.append(lob["trade_volume"])
                     row.append(lob["trade_value"])
+                    row.append(lob["limit_up_price"])
+                    row.append(lob["limit_down_price"])
+                    row.append(lob["last_price"])
+                    row.append(lob["twap"])
                     row.append(instr_info['share_holding'])
                     row.append(instr_info['orders'])
                     row.append(instr_info['error_orders'])
@@ -289,7 +298,7 @@ class DataCollector:
             self.day += 1
 
         await self.api.close_session()
-        
+
 async def main():
     username = 'UBIQ_TEAM179'
     password = 'ANfgOwr3SvpN'
